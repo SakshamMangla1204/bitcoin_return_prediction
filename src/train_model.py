@@ -1,59 +1,28 @@
-import math
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-try:
-    from xgboost import XGBRegressor
-    XGBOOST_AVAILABLE = True
-except ModuleNotFoundError:
-    XGBOOST_AVAILABLE = False
 
-try:
-    from sklearn.linear_model import LinearRegression
-    from sklearn.metrics import mean_absolute_error, mean_squared_error
-    from sklearn.preprocessing import StandardScaler
-except ModuleNotFoundError:
-    class LinearRegression:  # type: ignore[no-redef]
-        def fit(self, X, y):
-            X_arr = np.asarray(X, dtype=float)
-            y_arr = np.asarray(y, dtype=float)
-            X_design = np.c_[np.ones(X_arr.shape[0]), X_arr]
-            beta = np.linalg.lstsq(X_design, y_arr, rcond=None)[0]
-            self.intercept_ = beta[0]
-            self.coef_ = beta[1:]
-            return self
-
-        def predict(self, X):
-            X_arr = np.asarray(X, dtype=float)
-            return self.intercept_ + X_arr @ self.coef_
-
-    class StandardScaler:  # type: ignore[no-redef]
-        def fit(self, X):
-            X_arr = np.asarray(X, dtype=float)
-            self.mean_ = X_arr.mean(axis=0)
-            self.scale_ = X_arr.std(axis=0)
-            self.scale_[self.scale_ == 0] = 1.0
-            return self
-
-        def transform(self, X):
-            X_arr = np.asarray(X, dtype=float)
-            return (X_arr - self.mean_) / self.scale_
-
-    def mean_absolute_error(y_true, y_pred):  # type: ignore[no-redef]
-        y_true = np.asarray(y_true, dtype=float)
-        y_pred = np.asarray(y_pred, dtype=float)
-        return np.mean(np.abs(y_true - y_pred))
-
-    def mean_squared_error(y_true, y_pred):  # type: ignore[no-redef]
-        y_true = np.asarray(y_true, dtype=float)
-        y_pred = np.asarray(y_pred, dtype=float)
-        return np.mean((y_true - y_pred) ** 2)
-
-
-def load_processed_data() -> pd.DataFrame:
-    return pd.read_csv(
-        "data/processed/model_ready_data.csv",
-        parse_dates=["Date"],
-    )
+from data_loader import load_processed_data
+from evaluation import (
+    evaluate_direction_classification,
+    evaluate_predictions,
+    plot_feature_importance,
+    run_leakage_checks,
+    run_regime_analysis,
+)
+from features import FEATURE_COLS, chronological_split, prepare_model_frame
+from models import (
+    LinearRegression,
+    LogisticRegression,
+    StandardScaler,
+    XGBOOST_AVAILABLE,
+    XGBRegressor,
+    mean_absolute_error,
+    save_artifact,
+    tune_xgboost,
+    walk_forward_validate_linear,
+)
 
 
 def main() -> None:
@@ -61,84 +30,119 @@ def main() -> None:
     print("Dataset shape:", df.shape)
     print("Columns:", list(df.columns))
 
-    y = df["target"]
-    X = df.drop(columns=["target", "Date"])
+    model_df = prepare_model_frame(df, FEATURE_COLS)
+    X = model_df[FEATURE_COLS]
+    y = model_df["target"]
+
     print("X shape:", X.shape)
     print("y shape:", y.shape)
+    print("Using features:", FEATURE_COLS)
 
-    n = len(df)
-    split = int(0.8 * n)
-
-    X_train = X.iloc[:split]
-    X_test = X.iloc[split:]
-    y_train = y.iloc[:split]
-    y_test = y.iloc[split:]
+    split, X_train, X_test, y_train, y_test = chronological_split(X, y, split_ratio=0.8)
+    run_leakage_checks(model_df, split)
     print("Train size:", len(X_train))
     print("Test size:", len(X_test))
-
-    model_unscaled = LinearRegression()
-    model_unscaled.fit(X_train, y_train)
-    y_pred_unscaled = model_unscaled.predict(X_test)
-    mae_unscaled = mean_absolute_error(y_test, y_pred_unscaled)
 
     scaler = StandardScaler()
     X_train_scaled = scaler.fit(X_train).transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    model_scaled = LinearRegression()
-    model_scaled.fit(X_train_scaled, y_train)
-    y_pred_scaled = model_scaled.predict(X_test_scaled)
-    mae_scaled = mean_absolute_error(y_test, y_pred_scaled)
-    rmse_scaled = math.sqrt(mean_squared_error(y_test, y_pred_scaled))
+    linear_model = LinearRegression()
+    linear_model.fit(X_train_scaled, y_train)
+    y_pred_linear = linear_model.predict(X_test_scaled)
+    mae_linear = evaluate_predictions(y_test, y_pred_linear, "Linear (scaled)")
 
-    baseline_pred = np.zeros(len(y_test))
-    baseline_mae = mean_absolute_error(y_test, baseline_pred)
+    vol_threshold = float(X_train["volatility_7"].median())
+    run_regime_analysis(
+        y_test,
+        y_pred_linear,
+        X_test["volatility_7"],
+        vol_threshold,
+        "Linear (scaled)",
+    )
 
-    print("First 5 predictions (scaled model):", y_pred_scaled[:5])
-    print(f"MAE (unscaled): {mae_unscaled:.6f}")
-    print(f"MAE (scaled): {mae_scaled:.6f}")
-    print(f"RMSE (scaled): {rmse_scaled:.6f}")
+    baseline_mae = mean_absolute_error(y_test, np.zeros(len(y_test)))
+    buy_hold_return = float(np.prod(1 + y_test.to_numpy()) - 1)
+    print("First 5 linear predictions:", y_pred_linear[:5])
     print(f"Baseline MAE (predict zeros): {baseline_mae:.6f}")
+    print(f"Buy-and-hold return (test period): {buy_hold_return:.6f}")
+    print("Linear model has signal." if mae_linear < baseline_mae else "Linear model is useless.")
 
-    if mae_scaled < baseline_mae:
-        print("Model has signal.")
-    else:
-        print("Model is useless.")
-
-    coef_df = pd.DataFrame(
-        {"feature": X.columns, "coefficient": model_scaled.coef_}
-    )
-    coef_df["abs_coefficient"] = coef_df["coefficient"].abs()
-    coef_df = coef_df.sort_values("abs_coefficient", ascending=False)
-    top_feature = coef_df.iloc[0]
-    print(
-        "Strongest feature influence:",
-        f"{top_feature['feature']} (coef={top_feature['coefficient']:.6f})",
-    )
+    coef_df = pd.DataFrame({"feature": X.columns, "coefficient": linear_model.coef_})
+    coef_df["importance"] = coef_df["coefficient"].abs()
+    coef_df = coef_df.sort_values("importance", ascending=False)
     print("Top 5 features by absolute coefficient:")
     print(coef_df[["feature", "coefficient"]].head(5).to_string(index=False))
+    plot_feature_importance(
+        coef_df[["feature", "importance"]],
+        "Linear Regression Feature Importance (|coefficient|)",
+        Path("reports/linear_feature_importance.png"),
+    )
+    top_feature = str(coef_df.iloc[0]["feature"])
+    if top_feature == "volatility_7":
+        print("Interpretation hint: volatility dominates -> regime-style behavior.")
+    elif top_feature == "return_lag1":
+        print("Interpretation hint: lag1 dominates -> momentum-style behavior.")
+
+    y_dir_train = (y_train.to_numpy() > 0).astype(int)
+    y_dir_test = (y_test.to_numpy() > 0).astype(int)
+    dir_model = LogisticRegression(max_iter=1000, random_state=42)
+    dir_model.fit(X_train_scaled, y_dir_train)
+    y_dir_pred = dir_model.predict(X_test_scaled)
+    evaluate_direction_classification(y_dir_test, y_dir_pred, "Direction Classifier")
+
+    best_model = linear_model
+    best_model_name = "linear_regression_scaled"
+    best_mae = float(mae_linear)
+    best_scaler = scaler
+    best_xgb_params_output = None
 
     if XGBOOST_AVAILABLE:
+        print("Running XGBoost hyperparameter tuning (walk-forward on train split)...")
+        best_xgb_params, tuning_results = tune_xgboost(X_train, y_train)
+        print("Best XGBoost params:", best_xgb_params)
+        print("Top 5 XGBoost configs by walk-forward MAE:")
+        print(tuning_results.head(5).to_string(index=False))
+
         xgb_model = XGBRegressor(
             objective="reg:squarederror",
-            n_estimators=300,
-            learning_rate=0.05,
-            max_depth=4,
             subsample=0.8,
             colsample_bytree=0.8,
             random_state=42,
+            **best_xgb_params,
         )
         xgb_model.fit(X_train, y_train)
         y_pred_xgb = xgb_model.predict(X_test)
-        xgb_mae = mean_absolute_error(y_test, y_pred_xgb)
-        xgb_rmse = math.sqrt(mean_squared_error(y_test, y_pred_xgb))
-        print(f"XGBoost MAE: {xgb_mae:.6f}")
-        print(f"XGBoost RMSE: {xgb_rmse:.6f}")
+        mae_xgb = evaluate_predictions(y_test, y_pred_xgb, "XGBoost")
+        run_regime_analysis(
+            y_test,
+            y_pred_xgb,
+            X_test["volatility_7"],
+            vol_threshold,
+            "XGBoost",
+        )
+        print("First 5 XGBoost predictions:", y_pred_xgb[:5])
 
-        if xgb_mae < mae_scaled:
+        xgb_importance_df = pd.DataFrame(
+            {"feature": X.columns, "importance": xgb_model.feature_importances_}
+        ).sort_values("importance", ascending=False)
+        print("Top 5 XGBoost feature importances:")
+        print(xgb_importance_df.head(5).to_string(index=False))
+        plot_feature_importance(
+            xgb_importance_df,
+            "XGBoost Feature Importance",
+            Path("reports/xgboost_feature_importance.png"),
+        )
+
+        if mae_xgb < mae_linear:
             print("Better model by MAE: XGBoost")
+            best_model = xgb_model
+            best_model_name = "xgboost"
+            best_mae = float(mae_xgb)
+            best_scaler = None
         else:
             print("Better model by MAE: Linear Regression")
+        best_xgb_params_output = best_xgb_params
     else:
         print("XGBoost not installed. Install `xgboost` to run tree-based comparison.")
 
@@ -146,6 +150,28 @@ def main() -> None:
     full_scaler.fit(X)
     print("Final scaler fitted on full feature dataset.")
 
+    print("Running walk-forward validation (Linear Regression)...")
+    wf_linear_mae, wf_baseline_mae = walk_forward_validate_linear(X, y, n_splits=5)
+    print(f"Walk-forward avg Linear MAE: {wf_linear_mae:.6f}")
+    print(f"Walk-forward avg Baseline MAE: {wf_baseline_mae:.6f}")
+
+    models_dir = Path("models")
+    models_dir.mkdir(parents=True, exist_ok=True)
+    save_artifact(best_model, models_dir / "best_model.pkl")
+    save_artifact(best_scaler, models_dir / "scaler.pkl")
+    save_artifact(
+        {
+            "model_name": best_model_name,
+            "mae": best_mae,
+            "best_xgb_params": best_xgb_params_output,
+        },
+        models_dir / "model_metadata.pkl",
+    )
+    print("Saved best model to: models/best_model.pkl")
+    print("Saved scaler to: models/scaler.pkl")
+    print("Saved metadata to: models/model_metadata.pkl")
+
 
 if __name__ == "__main__":
     main()
+
